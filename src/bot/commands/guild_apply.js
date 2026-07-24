@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, ChannelType  } = require('discord.js');
+﻿const { SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, ChannelType  } = require('discord.js');
 const { get_ironman_skyblock_xp } = require('../utils/get_ironman_skyblock_xp');
 const { 
     embedColor, 
@@ -144,8 +144,12 @@ const create_application = async (interaction, db, client, member, ign, applicat
 
 
         // Send a message in the new channel
-        await application.send(`Welcome to your application channel, ${member}!
-Please note it could take up to a day to process your application. No further action is needed. `);
+        await application.send(`
+
+Welcome to your application channel, ${member}!
+Please note it could take up to a day to process your application. No further action is needed.
+
+`);
 
         return { applyMessage, channelId: application.id };
 
@@ -338,20 +342,21 @@ const handle_guild_accept = async (interaction, db, client) => {
         // Safe lookup with a fallback placeholder if guildName is unexpected
         const gmIgn = gmByGuild[guildName] ?? '<inviter_ign>';
 
-        let accepted_message = `You have been accepted into ${guildName}. You are now on the waitlist.
+        let accepted_message = `
 
-Before joining the guild make sure that you:
-- Enable visits for both island and garden (stand on each island and enable them to guild members or anyone)
-- Ensure you keep your APIs on at all times
-- Make sure to set /mystatus online
+## Welcome to ${guildName}!
+
+You have been accepted and placed on the waitlist. While you wait for your invite, please complete the following checklist:
+
+### Checklist before joining
+- Enable **Island Visits** and **Garden Visits** (Guild Members or Anyone)
+- Keep your **SkyBlock APIs enabled** at all times
+- If you have **multiple Ironman profiles**, enable APIs on **every** profile
+- Set \`/mystatus online\`
 - Read <#1346649034324185170>
-- IF YOU HAVE MULTIPLE IRONMAN PROFILES - ENABLE API'S ON ALL OF THEM
 
-If you are inactive for longer than 7 days you will be kicked.
-
-If you miss the invite - be patient, you will be reinvited. DO NOT MAKE A TICKET!\n
-
-You can also type /guild accept ${gmIgn} to join.\n`
+Members inactive for more than **7 days** may be removed from the guild.
+`
 
         // add the user to the waitlist
         switch(guildName) {
@@ -361,7 +366,7 @@ You can also type /guild accept ${gmIgn} to join.\n`
                 waitlist_message = await waitlist_channel.send(`${ign} (<@${userid}>) <#${application_channel}>`);
 
                 channel.send(`${ign} (<@${userid}>) has been accepted by ${interaction.user}!`);
-                accepted_message += `<#${IMS_waitlist}>`;
+                
                 break;
             case 'Ironman Casuals':
                 channel = await client.channels.fetch(IMC_application_channel);
@@ -369,7 +374,7 @@ You can also type /guild accept ${gmIgn} to join.\n`
                 waitlist_message = await waitlist_channel.send(`${ign} (<@${userid}>) <#${application_channel}>`);
 
                 channel.send(`${ign} (<@${userid}>) has been accepted by ${interaction.user}!`);
-                accepted_message += `<#${IMC_waitlist}>`;
+                
                 break;
             case 'Ironman Academy':
                 channel = await client.channels.fetch(IMA_application_channel);
@@ -377,11 +382,14 @@ You can also type /guild accept ${gmIgn} to join.\n`
                 waitlist_message = await waitlist_channel.send(`${ign} (<@${userid}>) <#${application_channel}>`);
 
                 channel.send(`${ign} (<@${userid}>) has been accepted by ${interaction.user}!`);
-                accepted_message += `<#${IMA_waitlist}>`;
+                
                 break;
         }
 
-        accepted_message += `\n<@${userid}>`;
+        accepted_message += `
+<#${guildName === 'Ironman Sweats' ? IMS_waitlist : guildName === 'Ironman Casuals' ? IMC_waitlist : IMA_waitlist}>
+
+<@${userid}>`;
 
         const WaitlistActions = new ActionRowBuilder()
             .addComponents(
@@ -595,13 +603,23 @@ const handle_guild_notify_invited = async (interaction, db, client) => {
             'Ironman Academy': IMA_gm_ign
         };
         const gmIgn = gmByGuild[guildName] ?? '<inviter_ign>';
-        let notify_invited_message = `You have been invited to ${guildName}. 
-        
-**Make sure to accept the invite when you next log in.** 
-        
-If you missed the invite, don't worry, you will receive another one. 
+        let notify_invited_message = `
 
-You can also type /guild accept ${gmIgn} to join. <@${userid}>`;
+## You've been invited to ${guildName}!
+
+If you missed or declined the invite, don't worry; we shall send another one.
+
+You can accept the guild invite popup if it appears.
+
+Alternatively,
+# NEXT TIME YOU LOG ON, TYPE /G ACCEPT ${gmIgn}.
+
+For convenience, copy this command:
+\`/g accept ${gmIgn} \`
+
+<@${userid}>
+
+`;
 
         const dm = await member.createDM();
         dm.send(notify_invited_message);
