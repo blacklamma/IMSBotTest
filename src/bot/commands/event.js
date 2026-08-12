@@ -1,6 +1,6 @@
 
 require('dotenv').config();
-const { ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, SlashCommandBuilder } = require('discord.js');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, PermissionFlagsBits, SlashCommandBuilder } = require('discord.js');
 const { create_embed } = require('./rank_guild');
 const { get_vanguard_corpse_count } = require('../utils/get_ironman_skyblock_xp');
 const { send_log_message } = require('../utils/send_log_message');
@@ -14,6 +14,7 @@ const {
     EVENT_HOURLY_SNAPSHOT_INTERVAL_MS,
     EVENT_HYPIXEL_MAX_ATTEMPTS,
     EVENT_SIGNUP_HYPIXEL_CONCURRENCY,
+    EVENT_LEADERBOARD_PAGE_SIZE,
 } = require('../constants');
 const EVENT_LOCK_NAME = 'vanguard_corpse_event_active';
 const ACTIVE_RUN_STATUSES = ['PENDING', 'PROCESSING'];
@@ -21,6 +22,7 @@ const SIGNUP_OPEN_EVENT_STATUSES = ['SIGNUP', 'RUNNING'];
 const SIGNUP_CLOSED_EVENT_STATUSES = ['ENDING', 'ENDED'];
 const EVENT_CONFIRM_PASSWORD = 'LanceIsBald';
 const EVENT_BUTTON_PREFIX = 'event_confirm_';
+const EVENT_LEADERBOARD_BUTTON_PREFIX = 'event_leaderboard_';
 
 const event_command = new SlashCommandBuilder()
     .setName('event')
@@ -159,6 +161,11 @@ const release_named_lock = async (connection, lockName) => {
 
 const get_active_event = async db => {
     const [rows] = await db.query('SELECT * FROM events WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1');
+    return rows[0] || null;
+};
+
+const get_event_by_id = async (db, eventId) => {
+    const [rows] = await db.query('SELECT * FROM events WHERE id = ?', [eventId]);
     return rows[0] || null;
 };
 
@@ -961,8 +968,7 @@ const build_leaderboard_rows = entries => {
     });
 };
 
-const get_leaderboard_payload = async db => {
-    const eventRecord = await get_current_leaderboard_event(db);
+const get_leaderboard_payload_for_event = async (db, eventRecord) => {
     if (!eventRecord) {
         return { ok: false, message: 'There is no Vanguard event to display yet.' };
     }
@@ -975,6 +981,104 @@ const get_leaderboard_payload = async db => {
         entries,
         rows: build_leaderboard_rows(entries),
     };
+};
+
+const get_leaderboard_payload = async db => {
+    const eventRecord = await get_current_leaderboard_event(db);
+    return get_leaderboard_payload_for_event(db, eventRecord);
+};
+
+const get_leaderboard_payload_by_event_id = async (db, eventId) => {
+    const eventRecord = await get_event_by_id(db, eventId);
+    return get_leaderboard_payload_for_event(db, eventRecord);
+};
+
+const build_event_leaderboard_button_custom_id = (direction, eventId, page) => {
+    return `${EVENT_LEADERBOARD_BUTTON_PREFIX}${direction}:${eventId}:${page}`;
+};
+
+const parse_event_leaderboard_button_custom_id = customId => {
+    if (!customId.startsWith(EVENT_LEADERBOARD_BUTTON_PREFIX)) {
+        return null;
+    }
+
+    const payload = customId.slice(EVENT_LEADERBOARD_BUTTON_PREFIX.length);
+    const [direction, rawEventId, rawPage] = payload.split(':');
+    const eventId = Number(rawEventId);
+    const page = Number(rawPage);
+    if (!direction || !Number.isInteger(eventId) || !Number.isInteger(page)) {
+        return null;
+    }
+
+    return { direction, eventId, page };
+};
+
+const get_event_leaderboard_page_count = rows => {
+    return Math.max(1, Math.ceil(rows.length / EVENT_LEADERBOARD_PAGE_SIZE));
+};
+
+const build_event_leaderboard_embed = payload => {
+    const pageCount = get_event_leaderboard_page_count(payload.rows);
+    const currentPage = Math.min(Math.max(payload.page || 0, 0), pageCount - 1);
+    const pageRows = payload.rows.slice(
+        currentPage * EVENT_LEADERBOARD_PAGE_SIZE,
+        (currentPage + 1) * EVENT_LEADERBOARD_PAGE_SIZE
+    );
+
+    const embed = new EmbedBuilder()
+        .setTitle(payload.event.name)
+        .setColor('#FFC3FF')
+        .setFooter({ text: `Page ${currentPage + 1}/${pageCount}` })
+        .setDescription(
+            `${payload.event.status === 'ENDED' ? 'Final Vanguard leaderboard\n' : 'Current Vanguard leaderboard\n'}${pageRows.join('')}`
+        );
+
+    return { embed, currentPage, pageCount };
+};
+
+const build_event_leaderboard_components = (eventId, currentPage, pageCount) => {
+    if (pageCount <= 1) {
+        return [];
+    }
+
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(build_event_leaderboard_button_custom_id('previous', eventId, currentPage))
+                .setLabel('Previous')
+                .setStyle(ButtonStyle.Primary),
+            new ButtonBuilder()
+                .setCustomId(build_event_leaderboard_button_custom_id('next', eventId, currentPage))
+                .setLabel('Next')
+                .setStyle(ButtonStyle.Primary)
+        ),
+    ];
+};
+
+const handle_event_leaderboard_button = async (interaction, db) => {
+    const parsed = parse_event_leaderboard_button_custom_id(interaction.customId);
+    if (!parsed) {
+        return false;
+    }
+
+    const payload = await get_leaderboard_payload_by_event_id(db, parsed.eventId);
+    if (!payload.ok) {
+        await interaction.update({ content: payload.message, embeds: [], components: [] });
+        return true;
+    }
+
+    const pageCount = get_event_leaderboard_page_count(payload.rows);
+    let nextPage = parsed.page;
+    if (parsed.direction === 'previous') {
+        nextPage = parsed.page > 0 ? parsed.page - 1 : pageCount - 1;
+    } else if (parsed.direction === 'next') {
+        nextPage = parsed.page + 1 < pageCount ? parsed.page + 1 : 0;
+    }
+
+    const { embed, currentPage } = build_event_leaderboard_embed({ ...payload, page: nextPage });
+    const components = build_event_leaderboard_components(payload.event.id, currentPage, pageCount);
+    await interaction.update({ embeds: [embed], components });
+    return true;
 };
 
 const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = get_vanguard_corpse_count, options = {}) => {
@@ -1220,12 +1324,11 @@ const event_interaction = async (interaction, db, client) => {
             return;
         }
 
-        await create_embed(
-            interaction,
-            payload.event.name,
-            payload.event.status === 'ENDED' ? 'Final Vanguard leaderboard\n' : 'Current Vanguard leaderboard\n',
-            payload.rows
-        );
+        const { embed, currentPage, pageCount } = build_event_leaderboard_embed({ ...payload, page: 0 });
+        await interaction.editReply({
+            embeds: [embed],
+            components: build_event_leaderboard_components(payload.event.id, currentPage, pageCount),
+        });
         return;
     }
 
@@ -1306,6 +1409,7 @@ module.exports = {
     event_command,
     event_interaction,
     handle_event_confirmation_button,
+    handle_event_leaderboard_button,
     tick_event_snapshot_processor,
     EVENT_SNAPSHOT_TICK_MS,
     EVENT_HYPIXEL_MAX_ATTEMPTS,
@@ -1319,6 +1423,7 @@ module.exports = {
     start_current_event,
     create_current_event,
     get_event_leaderboard_rows,
+    get_leaderboard_payload_by_event_id,
     create_concurrency_limiter,
     create_event_processor_runner,
 };
