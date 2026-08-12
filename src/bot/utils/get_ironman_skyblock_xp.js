@@ -226,9 +226,9 @@ const is_retryable_hypixel_failure = failureCode => {
     ].includes(failureCode);
 };
 
-const get_vanguard_corpse_count = async uuid => {
+const get_vanguard_corpse_count = async (uuid, options = {}) => {
     const normalizedUuid = normalize_uuid(uuid);
-    const profileResponse = await fetch_skyblock_profiles(normalizedUuid);
+    const profileResponse = await fetch_skyblock_profiles(normalizedUuid, process.env.HYPIXEL_API_KEY, options);
 
     if (!profileResponse.ok) {
         return {
@@ -236,6 +236,7 @@ const get_vanguard_corpse_count = async uuid => {
             failureCode: profileResponse.failureCode,
             message: profileResponse.message,
             retryAfterMs: profileResponse.retryAfterMs ?? null,
+            rateLimit: profileResponse.rateLimit ?? null,
             retryable: is_retryable_hypixel_failure(profileResponse.failureCode),
         };
     }
