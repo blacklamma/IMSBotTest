@@ -13,14 +13,21 @@ const {
     EVENT_SNAPSHOT_CLAIM_TIMEOUT_MS,
     EVENT_HOURLY_SNAPSHOT_INTERVAL_MS,
     EVENT_HYPIXEL_MAX_ATTEMPTS,
+    EVENT_SIGNUP_HYPIXEL_CONCURRENCY,
 } = require('../constants');
 const EVENT_LOCK_NAME = 'vanguard_corpse_event_active';
 const ACTIVE_RUN_STATUSES = ['PENDING', 'PROCESSING'];
+const SIGNUP_OPEN_EVENT_STATUSES = ['SIGNUP', 'RUNNING'];
+const SIGNUP_CLOSED_EVENT_STATUSES = ['ENDING', 'ENDED'];
 
 const event_command = new SlashCommandBuilder()
     .setName('event')
     .setDescription('Vanguard Corpse event commands')
     .setDMPermission(false)
+    .addSubcommand(subcommand =>
+        subcommand
+            .setName('create')
+            .setDescription('Create a new Vanguard Corpse event'))
     .addSubcommand(subcommand =>
         subcommand
             .setName('signup')
@@ -41,6 +48,35 @@ const event_command = new SlashCommandBuilder()
 const ensure_moderator_permissions = interaction => {
     return interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers);
 };
+
+const create_concurrency_limiter = limit => {
+    const maxConcurrency = Math.max(1, Number(limit) || 1);
+    const queue = [];
+    let activeCount = 0;
+
+    const tryRunNext = () => {
+        if (activeCount >= maxConcurrency || !queue.length) {
+            return;
+        }
+
+        const { work, resolve, reject } = queue.shift();
+        activeCount += 1;
+        Promise.resolve()
+            .then(work)
+            .then(resolve, reject)
+            .finally(() => {
+                activeCount -= 1;
+                tryRunNext();
+            });
+    };
+
+    return work => new Promise((resolve, reject) => {
+        queue.push({ work, resolve, reject });
+        tryRunNext();
+    });
+};
+
+const signup_hypixel_lookup_limiter = create_concurrency_limiter(EVENT_SIGNUP_HYPIXEL_CONCURRENCY);
 
 const run_in_transaction = async (db, work) => {
     const connection = await db.getConnection();
@@ -71,6 +107,16 @@ const get_active_event = async db => {
     return rows[0] || null;
 };
 
+const get_active_event_for_update = async db => {
+    const [rows] = await db.query('SELECT * FROM events WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1 FOR UPDATE');
+    return rows[0] || null;
+};
+
+const get_event_by_id_for_update = async (db, eventId) => {
+    const [rows] = await db.query('SELECT * FROM events WHERE id = ? FOR UPDATE', [eventId]);
+    return rows[0] || null;
+};
+
 const get_current_leaderboard_event = async db => {
     const activeEvent = await get_active_event(db);
     if (activeEvent) {
@@ -92,7 +138,7 @@ const get_linked_minecraft_account = async (db, discordUserId) => {
     return rows[0] || null;
 };
 
-const get_or_create_signup_event = async (db, now) => {
+const create_signup_event = async (db, now) => {
     return run_in_transaction(db, async connection => {
         const locked = await get_named_lock(connection, EVENT_LOCK_NAME);
         if (!locked) {
@@ -117,6 +163,19 @@ const get_or_create_signup_event = async (db, now) => {
             await release_named_lock(connection, EVENT_LOCK_NAME);
         }
     });
+};
+
+const get_signup_event = async db => {
+    const activeEvent = await get_active_event(db);
+    if (!activeEvent) {
+        return null;
+    }
+
+    if (!SIGNUP_OPEN_EVENT_STATUSES.includes(activeEvent.status)) {
+        return activeEvent;
+    }
+
+    return activeEvent;
 };
 
 const get_event_participant_by_discord_id = async (db, eventId, discordUserId) => {
@@ -190,6 +249,10 @@ const create_event_participant = async (db, participant) => {
     return rows[0] || null;
 };
 const compute_snapshot_bucket = (snapshotType, startedAt) => {
+    if (snapshotType === 'INITIAL') {
+        return null;
+    }
+
     if (snapshotType !== 'HOURLY') {
         return snapshotType;
     }
@@ -198,7 +261,7 @@ const compute_snapshot_bucket = (snapshotType, startedAt) => {
     return new Date(hour).toISOString();
 };
 
-const create_snapshot_run_with_tasks = async (db, options) => {
+const create_snapshot_run_with_tasks_in_connection = async (connection, options) => {
     const {
         eventId,
         snapshotType,
@@ -208,74 +271,150 @@ const create_snapshot_run_with_tasks = async (db, options) => {
         allowExisting = false,
     } = options;
 
-    return run_in_transaction(db, async connection => {
-        const participants = await list_event_participants(connection, eventId);
-        const totalParticipants = participants.length;
-        const initialStatus = totalParticipants === 0 ? 'COMPLETED' : 'PENDING';
-        const completedAt = totalParticipants === 0 ? startedAt : null;
-        const snapshotBucket = compute_snapshot_bucket(snapshotType, startedAt);
+    const participants = await list_event_participants(connection, eventId);
+    const totalParticipants = participants.length;
+    const initialStatus = totalParticipants === 0 ? 'COMPLETED' : 'PENDING';
+    const completedAt = totalParticipants === 0 ? startedAt : null;
+    const snapshotBucket = compute_snapshot_bucket(snapshotType, startedAt);
 
-        try {
-            const [runResult] = await connection.query(
-                `INSERT INTO event_snapshot_runs (
-                    event_id,
-                    snapshot_type,
-                    snapshot_bucket,
+    try {
+        const [runResult] = await connection.query(
+            `INSERT INTO event_snapshot_runs (
+                event_id,
+                snapshot_type,
+                snapshot_bucket,
+                status,
+                batch_size,
+                batch_delay_ms,
+                started_at,
+                next_batch_at,
+                completed_at,
+                total_participants
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                eventId,
+                snapshotType,
+                snapshotBucket,
+                initialStatus,
+                batchSize,
+                batchDelayMs,
+                startedAt,
+                startedAt,
+                completedAt,
+                totalParticipants,
+            ]
+        );
+
+        const snapshotRunId = runResult.insertId;
+        if (participants.length) {
+            const values = participants.map(participant => [
+                snapshotRunId,
+                participant.id,
+                'PENDING',
+                startedAt,
+            ]);
+
+            await connection.query(
+                `INSERT INTO event_snapshot_tasks (
+                    snapshot_run_id,
+                    participant_id,
                     status,
-                    batch_size,
-                    batch_delay_ms,
-                    started_at,
-                    next_batch_at,
-                    completed_at,
-                    total_participants
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                    eventId,
-                    snapshotType,
-                    snapshotBucket,
-                    initialStatus,
-                    batchSize,
-                    batchDelayMs,
-                    startedAt,
-                    startedAt,
-                    completedAt,
-                    totalParticipants,
-                ]
+                    available_at
+                ) VALUES ?`,
+                [values]
             );
-
-            const snapshotRunId = runResult.insertId;
-            if (participants.length) {
-                const values = participants.map(participant => [
-                    snapshotRunId,
-                    participant.id,
-                    'PENDING',
-                    startedAt,
-                ]);
-
-                await connection.query(
-                    `INSERT INTO event_snapshot_tasks (
-                        snapshot_run_id,
-                        participant_id,
-                        status,
-                        available_at
-                    ) VALUES ?`,
-                    [values]
-                );
-            }
-
-            const [rows] = await connection.query('SELECT * FROM event_snapshot_runs WHERE id = ?', [snapshotRunId]);
-            return { created: true, run: rows[0], participantCount: totalParticipants };
-        } catch (error) {
-            if (allowExisting && error?.code === 'ER_DUP_ENTRY' && snapshotBucket) {
-                const [rows] = await connection.query(
-                    'SELECT * FROM event_snapshot_runs WHERE event_id = ? AND snapshot_type = ? AND snapshot_bucket = ? LIMIT 1',
-                    [eventId, snapshotType, snapshotBucket]
-                );
-                return { created: false, run: rows[0] || null, participantCount: rows[0]?.total_participants ?? 0 };
-            }
-            throw error;
         }
+
+        const [rows] = await connection.query('SELECT * FROM event_snapshot_runs WHERE id = ?', [snapshotRunId]);
+        return { created: true, run: rows[0], participantCount: totalParticipants };
+    } catch (error) {
+        if (allowExisting && error?.code === 'ER_DUP_ENTRY' && snapshotBucket) {
+            const [rows] = await connection.query(
+                'SELECT * FROM event_snapshot_runs WHERE event_id = ? AND snapshot_type = ? AND snapshot_bucket = ? LIMIT 1',
+                [eventId, snapshotType, snapshotBucket]
+            );
+            return { created: false, run: rows[0] || null, participantCount: rows[0]?.total_participants ?? 0 };
+        }
+        throw error;
+    }
+};
+
+const create_snapshot_run_with_tasks = async (db, options) => {
+    return run_in_transaction(db, async connection => {
+        return create_snapshot_run_with_tasks_in_connection(connection, options);
     });
+};
+
+const insert_event_snapshot = async (db, payload) => {
+    await db.query(
+        `INSERT INTO event_snapshots (
+            snapshot_run_id, event_id, participant_id, snapshot_type, corpse_count, captured_at, is_final_snapshot
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            corpse_count = VALUES(corpse_count),
+            captured_at = VALUES(captured_at),
+            is_final_snapshot = VALUES(is_final_snapshot)`,
+        [
+            payload.snapshotRunId,
+            payload.eventId,
+            payload.participantId,
+            payload.snapshotType,
+            payload.corpseCount,
+            payload.capturedAt,
+            payload.snapshotType === 'FINAL' ? 1 : 0,
+        ]
+    );
+};
+
+const create_initial_signup_snapshot = async (connection, payload) => {
+    const baselineAt = payload.capturedAt || payload.startedAt;
+    const [runResult] = await connection.query(
+        `INSERT INTO event_snapshot_runs (
+            event_id,
+            snapshot_type,
+            snapshot_bucket,
+            status,
+            batch_size,
+            batch_delay_ms,
+            started_at,
+            next_batch_at,
+            completed_at,
+            total_participants
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+            payload.eventId,
+            'INITIAL',
+            compute_snapshot_bucket('INITIAL', baselineAt),
+            'COMPLETED',
+            1,
+            0,
+            baselineAt,
+            baselineAt,
+            baselineAt,
+            1,
+        ]
+    );
+
+    await insert_event_snapshot(connection, {
+        snapshotRunId: runResult.insertId,
+        eventId: payload.eventId,
+        participantId: payload.participantId,
+        snapshotType: 'INITIAL',
+        corpseCount: payload.corpseCount,
+        capturedAt: baselineAt,
+    });
+
+    await update_snapshot_run_progress(connection, runResult.insertId, {
+        status: 'COMPLETED',
+        nextBatchAt: baselineAt,
+        completedAt: baselineAt,
+        succeededCount: 1,
+        failedCount: 0,
+        lastError: null,
+    });
+
+    const [rows] = await connection.query('SELECT * FROM event_snapshot_runs WHERE id = ?', [runResult.insertId]);
+    return rows[0] || null;
 };
 
 const list_ready_snapshot_runs = async (db, now) => {
@@ -338,24 +477,7 @@ const claim_snapshot_tasks = async (db, snapshotRunId, batchSize, now, claimToke
 };
 
 const mark_snapshot_task_succeeded = async (db, payload) => {
-    await db.query(
-        `INSERT INTO event_snapshots (
-            snapshot_run_id, event_id, participant_id, snapshot_type, corpse_count, captured_at, is_final_snapshot
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE
-            corpse_count = VALUES(corpse_count),
-            captured_at = VALUES(captured_at),
-            is_final_snapshot = VALUES(is_final_snapshot)`,
-        [
-            payload.snapshotRunId,
-            payload.eventId,
-            payload.participantId,
-            payload.snapshotType,
-            payload.corpseCount,
-            payload.capturedAt,
-            payload.snapshotType === 'FINAL' ? 1 : 0,
-        ]
-    );
+    await insert_event_snapshot(db, payload);
 
     await db.query(
         `UPDATE event_snapshot_tasks
@@ -439,11 +561,24 @@ const should_create_hourly_snapshot = (eventRecord, latestHourlyRun, now) => {
     return now - latestHourlyRun.started_at >= EVENT_HOURLY_SNAPSHOT_INTERVAL_MS;
 };
 
-const build_snapshot_retry_delay = retryAfterMs => {
-    if (!retryAfterMs || retryAfterMs <= 0) {
+const build_snapshot_retry_delay = retryDetails => {
+    if (typeof retryDetails === 'number') {
+        if (retryDetails <= 0) {
+            return EVENT_SNAPSHOT_BATCH_DELAY_MS;
+        }
+        return Math.max(retryDetails, EVENT_SNAPSHOT_BATCH_DELAY_MS);
+    }
+
+    const retryAfterMs = retryDetails?.retryAfterMs ?? retryDetails?.rateLimit?.retryAfterMs ?? null;
+    const resetAfterMs = retryDetails?.resetAfterMs ?? retryDetails?.rateLimit?.resetAfterMs ?? null;
+    const candidateDelayMs = [retryAfterMs, resetAfterMs]
+        .filter(value => Number.isFinite(value) && value > 0)
+        .reduce((largest, value) => Math.max(largest, value), 0);
+
+    if (!candidateDelayMs) {
         return EVENT_SNAPSHOT_BATCH_DELAY_MS;
     }
-    return Math.max(retryAfterMs, EVENT_SNAPSHOT_BATCH_DELAY_MS);
+    return Math.max(candidateDelayMs, EVENT_SNAPSHOT_BATCH_DELAY_MS);
 };
 
 const finalize_snapshot_run_if_finished = async (db, client, snapshotRun) => {
@@ -532,9 +667,10 @@ const process_snapshot_run_batch = async (db, client, snapshotRun, fetchCorpseCo
 
         const reachedMaxAttempts = nextAttempt >= EVENT_HYPIXEL_MAX_ATTEMPTS;
         if (lookupResult.failureCode === 'HYPIXEL_RATE_LIMITED' && !reachedMaxAttempts) {
+            const retryDelayMs = build_snapshot_retry_delay(lookupResult);
             await mark_snapshot_task_for_retry(db, {
                 taskId: task.id,
-                availableAt: Date.now() + build_snapshot_retry_delay(lookupResult.retryAfterMs),
+                availableAt: Date.now() + retryDelayMs,
                 failureCode: lookupResult.failureCode,
                 failureMessage: lookupResult.message,
                 lastAttemptAt: Date.now(),
@@ -618,62 +754,49 @@ const tick_event_snapshot_processor = async (db, client, options = {}) => {
 };
 
 const get_event_leaderboard_rows = async (db, eventId) => {
-    const [rows] = await db.query(
-        `SELECT
-            participant.id,
-            participant.minecraft_uuid,
-            participant.minecraft_username,
-            start_snapshot.corpse_count AS start_corpse_count,
-            final_snapshot.corpse_count AS final_corpse_count,
-            latest_snapshot.corpse_count AS latest_corpse_count,
-            latest_snapshot.captured_at AS latest_captured_at
-         FROM event_participants participant
-         LEFT JOIN (
-            SELECT s1.participant_id, s1.corpse_count, s1.captured_at
-            FROM event_snapshots s1
-            JOIN (
-                SELECT participant_id, MAX(captured_at) AS max_captured_at
-                FROM event_snapshots
-                WHERE event_id = ? AND snapshot_type = 'START'
-                GROUP BY participant_id
-            ) latest_start ON latest_start.participant_id = s1.participant_id AND latest_start.max_captured_at = s1.captured_at
-            WHERE s1.event_id = ? AND s1.snapshot_type = 'START'
-         ) start_snapshot ON start_snapshot.participant_id = participant.id
-         LEFT JOIN (
-            SELECT s2.participant_id, s2.corpse_count, s2.captured_at
-            FROM event_snapshots s2
-            JOIN (
-                SELECT participant_id, MAX(captured_at) AS max_captured_at
-                FROM event_snapshots
-                WHERE event_id = ? AND snapshot_type = 'FINAL'
-                GROUP BY participant_id
-            ) latest_final ON latest_final.participant_id = s2.participant_id AND latest_final.max_captured_at = s2.captured_at
-            WHERE s2.event_id = ? AND s2.snapshot_type = 'FINAL'
-         ) final_snapshot ON final_snapshot.participant_id = participant.id
-         LEFT JOIN (
-            SELECT s3.participant_id, s3.corpse_count, s3.captured_at
-            FROM event_snapshots s3
-            JOIN (
-                SELECT participant_id, MAX(captured_at) AS max_captured_at
-                FROM event_snapshots
-                WHERE event_id = ?
-                GROUP BY participant_id
-            ) latest_any ON latest_any.participant_id = s3.participant_id AND latest_any.max_captured_at = s3.captured_at
-            WHERE s3.event_id = ?
-         ) latest_snapshot ON latest_snapshot.participant_id = participant.id
-         WHERE participant.event_id = ?
-         ORDER BY participant.signup_at ASC, participant.id ASC`,
-        [eventId, eventId, eventId, eventId, eventId, eventId, eventId]
+    const participants = await list_event_participants(db, eventId);
+    const [snapshotRows] = await db.query(
+        `SELECT participant_id, snapshot_type, corpse_count, captured_at
+         FROM event_snapshots
+         WHERE event_id = ?
+         ORDER BY participant_id ASC, captured_at ASC, id ASC`,
+        [eventId]
     );
-    return rows;
+
+    const snapshotsByParticipantId = new Map();
+    for (const snapshot of snapshotRows) {
+        if (!snapshotsByParticipantId.has(snapshot.participant_id)) {
+            snapshotsByParticipantId.set(snapshot.participant_id, []);
+        }
+        snapshotsByParticipantId.get(snapshot.participant_id).push(snapshot);
+    }
+
+    return participants.map(participant => {
+        const participantSnapshots = snapshotsByParticipantId.get(participant.id) || [];
+        const baselineSnapshot = participantSnapshots[0] || null;
+        const latestSnapshot = participantSnapshots[participantSnapshots.length - 1] || null;
+        const finalSnapshots = participantSnapshots.filter(snapshot => snapshot.snapshot_type === 'FINAL');
+        const finalSnapshot = finalSnapshots[finalSnapshots.length - 1] || null;
+
+        return {
+            id: participant.id,
+            minecraft_uuid: participant.minecraft_uuid,
+            minecraft_username: participant.minecraft_username,
+            baseline_corpse_count: baselineSnapshot?.corpse_count ?? null,
+            baseline_snapshot_type: baselineSnapshot?.snapshot_type ?? null,
+            final_corpse_count: finalSnapshot?.corpse_count ?? null,
+            latest_corpse_count: latestSnapshot?.corpse_count ?? null,
+            latest_captured_at: latestSnapshot?.captured_at ?? null,
+        };
+    });
 };
 
 const build_leaderboard_entries = (eventRecord, participantRows) => {
     const entries = participantRows.map(row => {
         const displayName = row.minecraft_username || row.minecraft_uuid;
-        const hasStartSnapshot = row.start_corpse_count !== null && row.start_corpse_count !== undefined;
+        const hasBaselineSnapshot = row.baseline_corpse_count !== null && row.baseline_corpse_count !== undefined;
 
-        if (!hasStartSnapshot) {
+        if (!hasBaselineSnapshot) {
             return { displayName, score: null, state: 'PENDING', note: null };
         }
 
@@ -689,7 +812,7 @@ const build_leaderboard_entries = (eventRecord, participantRows) => {
         const finalFailed = eventRecord.status === 'ENDED' && !finalValueExists && row.latest_captured_at !== null;
         return {
             displayName,
-            score: currentValue - row.start_corpse_count,
+            score: currentValue - row.baseline_corpse_count,
             state: 'OK',
             note: finalFailed ? 'latest snapshot used; final failed' : null,
         };
@@ -752,11 +875,16 @@ const get_leaderboard_payload = async db => {
     };
 };
 
-const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = get_vanguard_corpse_count) => {
+const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = get_vanguard_corpse_count, options = {}) => {
+    const signupFetchLimiter = options.signupFetchLimiter || signup_hypixel_lookup_limiter;
     const now = Date.now();
-    const eventRecord = await get_or_create_signup_event(db, now);
+    const eventRecord = await get_signup_event(db);
 
-    if (eventRecord.status === 'RUNNING' || eventRecord.status === 'ENDING') {
+    if (!eventRecord) {
+        return { ok: false, message: 'There is no active Vanguard event. Wait for a moderator to create one first.' };
+    }
+
+    if (eventRecord.status === 'ENDING') {
         return { ok: false, message: 'Signup is closed because the current Vanguard event has already started.' };
     }
     if (eventRecord.status === 'ENDED') {
@@ -778,14 +906,32 @@ const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = ge
         return { ok: false, message: 'That linked Minecraft account is already signed up for the current Vanguard event.' };
     }
 
-    const vanguardResult = await fetchCorpseCount(linkedAccount.uuid);
+    const vanguardResult = await signupFetchLimiter(() => fetchCorpseCount(linkedAccount.uuid));
     if (!vanguardResult.ok) {
         return { ok: false, message: `Could not fetch your Vanguard Corpse data: ${vanguardResult.message}` };
     }
 
-    try {
-        const participant = await create_event_participant(db, {
-            eventId: eventRecord.id,
+    return run_in_transaction(db, async connection => {
+        const lockedEvent = await get_event_by_id_for_update(connection, eventRecord.id);
+        if (!lockedEvent || SIGNUP_CLOSED_EVENT_STATUSES.includes(lockedEvent.status)) {
+            return { ok: false, message: 'Signup is closed because the current Vanguard event is ending or has already ended.' };
+        }
+        if (!SIGNUP_OPEN_EVENT_STATUSES.includes(lockedEvent.status)) {
+            return { ok: false, message: 'There is no Vanguard event currently accepting signups.' };
+        }
+
+        const duplicateDiscordParticipant = await get_event_participant_by_discord_id(connection, lockedEvent.id, discordUserId);
+        if (duplicateDiscordParticipant) {
+            return { ok: false, message: 'You are already signed up for the current Vanguard event.' };
+        }
+
+        const duplicateMinecraftParticipant = await get_event_participant_by_minecraft_uuid(connection, lockedEvent.id, linkedAccount.uuid);
+        if (duplicateMinecraftParticipant) {
+            return { ok: false, message: 'That linked Minecraft account is already signed up for the current Vanguard event.' };
+        }
+
+        const participant = await create_event_participant(connection, {
+            eventId: lockedEvent.id,
             discordUserId,
             minecraftUuid: linkedAccount.uuid,
             minecraftUsername: linkedAccount.ign,
@@ -793,80 +939,99 @@ const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = ge
             signupAt: now,
         });
 
-        return { ok: true, event: eventRecord, participant, vanguard: vanguardResult };
-    } catch (error) {
-        if (error?.code === 'ER_DUP_ENTRY') {
-            return { ok: false, message: 'You are already signed up for the current Vanguard event.' };
+        if (lockedEvent.status === 'RUNNING') {
+            await create_initial_signup_snapshot(connection, {
+                eventId: lockedEvent.id,
+                participantId: participant.id,
+                corpseCount: vanguardResult.count,
+                capturedAt: vanguardResult.capturedAt,
+                startedAt: now,
+            });
         }
-        throw error;
+
+        return { ok: true, event: lockedEvent, participant, vanguard: vanguardResult };
+    });
+};
+
+const create_current_event = async db => {
+    const now = Date.now();
+    const existingActiveEvent = await get_active_event(db);
+    if (existingActiveEvent) {
+        return { ok: false, message: 'There is already an active Vanguard event.' };
     }
+
+    const eventRecord = await create_signup_event(db, now);
+    return { ok: true, event: eventRecord };
 };
 
 const start_current_event = async db => {
-    const eventRecord = await get_active_event(db);
-    if (!eventRecord || eventRecord.status !== 'SIGNUP') {
-        return { ok: false, message: 'There is no Vanguard event currently in signup state.' };
-    }
+    return run_in_transaction(db, async connection => {
+        const eventRecord = await get_active_event_for_update(connection);
+        if (!eventRecord || eventRecord.status !== 'SIGNUP') {
+            return { ok: false, message: 'There is no Vanguard event currently in signup state.' };
+        }
 
-    if (await has_active_snapshot_run(db, eventRecord.id)) {
-        return { ok: false, message: 'A snapshot run is already active for this event.' };
-    }
+        if (await has_active_snapshot_run(connection, eventRecord.id)) {
+            return { ok: false, message: 'A snapshot run is already active for this event.' };
+        }
 
-    const startedAt = Date.now();
-    const updatedEvent = await update_event_status(db, eventRecord.id, {
-        status: 'RUNNING',
-        started_at: startedAt,
-        ending_started_at: null,
-        ended_at: null,
+        const startedAt = Date.now();
+        const { run, participantCount } = await create_snapshot_run_with_tasks_in_connection(connection, {
+            eventId: eventRecord.id,
+            snapshotType: 'START',
+            batchSize: EVENT_SNAPSHOT_BATCH_SIZE,
+            batchDelayMs: EVENT_SNAPSHOT_BATCH_DELAY_MS,
+            startedAt,
+            allowExisting: true,
+        });
+
+        const updatedEvent = await update_event_status(connection, eventRecord.id, {
+            status: 'RUNNING',
+            started_at: startedAt,
+            ending_started_at: null,
+            ended_at: null,
+        });
+
+        return { ok: true, event: updatedEvent, snapshotRun: run, participantCount };
     });
-
-    const { run, participantCount } = await create_snapshot_run_with_tasks(db, {
-        eventId: updatedEvent.id,
-        snapshotType: 'START',
-        batchSize: EVENT_SNAPSHOT_BATCH_SIZE,
-        batchDelayMs: EVENT_SNAPSHOT_BATCH_DELAY_MS,
-        startedAt,
-        allowExisting: true,
-    });
-
-    return { ok: true, event: updatedEvent, snapshotRun: run, participantCount };
 };
 
 const end_current_event = async db => {
-    const eventRecord = await get_active_event(db);
-    if (!eventRecord || eventRecord.status !== 'RUNNING') {
-        return { ok: false, message: 'There is no Vanguard event currently running.' };
-    }
+    return run_in_transaction(db, async connection => {
+        const eventRecord = await get_active_event_for_update(connection);
+        if (!eventRecord || eventRecord.status !== 'RUNNING') {
+            return { ok: false, message: 'There is no Vanguard event currently running.' };
+        }
 
-    if (await has_active_snapshot_run(db, eventRecord.id)) {
-        return { ok: false, message: 'An event snapshot run is already active. Wait for it to finish before ending the event.' };
-    }
+        if (await has_active_snapshot_run(connection, eventRecord.id)) {
+            return { ok: false, message: 'An event snapshot run is already active. Wait for it to finish before ending the event.' };
+        }
 
-    const endingStartedAt = Date.now();
-    const updatedEvent = await update_event_status(db, eventRecord.id, {
-        status: 'ENDING',
-        ending_started_at: endingStartedAt,
-    });
-
-    const { run, participantCount } = await create_snapshot_run_with_tasks(db, {
-        eventId: updatedEvent.id,
-        snapshotType: 'FINAL',
-        batchSize: EVENT_SNAPSHOT_BATCH_SIZE,
-        batchDelayMs: EVENT_SNAPSHOT_BATCH_DELAY_MS,
-        startedAt: endingStartedAt,
-        allowExisting: true,
-    });
-
-    if (participantCount === 0) {
-        const endedEvent = await update_event_status(db, updatedEvent.id, {
-            status: 'ENDED',
-            is_active: 0,
-            ended_at: endingStartedAt,
+        const endingStartedAt = Date.now();
+        const { run, participantCount } = await create_snapshot_run_with_tasks_in_connection(connection, {
+            eventId: eventRecord.id,
+            snapshotType: 'FINAL',
+            batchSize: EVENT_SNAPSHOT_BATCH_SIZE,
+            batchDelayMs: EVENT_SNAPSHOT_BATCH_DELAY_MS,
+            startedAt: endingStartedAt,
+            allowExisting: true,
         });
-        return { ok: true, event: endedEvent, snapshotRun: run, participantCount };
-    }
 
-    return { ok: true, event: updatedEvent, snapshotRun: run, participantCount };
+        const eventFields = participantCount === 0
+            ? {
+                status: 'ENDED',
+                is_active: 0,
+                ending_started_at: endingStartedAt,
+                ended_at: endingStartedAt,
+            }
+            : {
+                status: 'ENDING',
+                ending_started_at: endingStartedAt,
+            };
+
+        const updatedEvent = await update_event_status(connection, eventRecord.id, eventFields);
+        return { ok: true, event: updatedEvent, snapshotRun: run, participantCount };
+    });
 };
 
 const event_interaction = async (interaction, db, client) => {
@@ -908,6 +1073,19 @@ const event_interaction = async (interaction, db, client) => {
 
     if (!ensure_moderator_permissions(interaction)) {
         await interaction.reply({ content: 'You do not have permission to use this event subcommand.', ephemeral: true });
+        return;
+    }
+
+    if (subcommand === 'create') {
+        await interaction.deferReply({ ephemeral: true });
+        const result = await create_current_event(db);
+        if (!result.ok) {
+            await interaction.editReply(result.message);
+            return;
+        }
+
+        await send_log_message(client, `Vanguard event created by <@${interaction.user.id}>. event=${result.event.id}`);
+        await interaction.editReply(`Vanguard event created.\nEvent: \`${result.event.name}\`\nStatus: \`${result.event.status}\``);
         return;
     }
 
@@ -967,6 +1145,10 @@ module.exports = {
     create_hourly_snapshots_if_needed,
     process_snapshot_run_batch,
     end_current_event,
+    start_current_event,
+    create_current_event,
+    get_event_leaderboard_rows,
+    create_concurrency_limiter,
     create_event_processor_runner,
 };
 
