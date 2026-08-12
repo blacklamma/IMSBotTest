@@ -36,7 +36,7 @@ const { autosync_roles_all_guilds } = require('./src/bot/commands/autosync_roles
 const { fetch_guild_data, rank_guild_command, rank_guild_interaction } = require('./src/bot/commands/rank_guild');
 const { refresh_current_snapshot_command, refresh_current_snapshot_interaction, sync_all_guilds } = require('./src/bot/commands/refresh_current_snapshot');
 const { check_garden_command, check_garden_interaction } = require('./src/bot/commands/check_garden');
-const { event_command, event_interaction, tick_event_snapshot_processor, EVENT_SNAPSHOT_TICK_MS } = require('./src/bot/commands/event');
+const { event_command, event_interaction, handle_event_confirmation_button, tick_event_snapshot_processor, EVENT_SNAPSHOT_TICK_MS } = require('./src/bot/commands/event');
 const { track_user_command, track_user_interaction, process_active_tracking_sessions, stop_all_tracking } = require('./src/bot/commands/track_user');
 const PIN_THREAD_PARENT_IDS = [qna_channel];
 // Create a new client instance
@@ -224,6 +224,8 @@ client.on('interactionCreate', async interaction => {
     else if (interaction.isButton()) {
         if (interaction.customId.startsWith('apply_')) {
             await handle_guild_selection(interaction, db, client);
+        } else if (interaction.customId.startsWith('event_confirm_')) {
+            await handle_event_confirmation_button(interaction, db, client);
         } else {
             switch (interaction.customId) {
                 case 'guild_accept':

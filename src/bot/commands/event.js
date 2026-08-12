@@ -1,6 +1,6 @@
 
 require('dotenv').config();
-const { PermissionFlagsBits, SlashCommandBuilder } = require('discord.js');
+const { ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, SlashCommandBuilder } = require('discord.js');
 const { create_embed } = require('./rank_guild');
 const { get_vanguard_corpse_count } = require('../utils/get_ironman_skyblock_xp');
 const { send_log_message } = require('../utils/send_log_message');
@@ -19,6 +19,8 @@ const EVENT_LOCK_NAME = 'vanguard_corpse_event_active';
 const ACTIVE_RUN_STATUSES = ['PENDING', 'PROCESSING'];
 const SIGNUP_OPEN_EVENT_STATUSES = ['SIGNUP', 'RUNNING'];
 const SIGNUP_CLOSED_EVENT_STATUSES = ['ENDING', 'ENDED'];
+const EVENT_CONFIRM_PASSWORD = 'LanceIsBald';
+const EVENT_BUTTON_PREFIX = 'event_confirm_';
 
 const event_command = new SlashCommandBuilder()
     .setName('event')
@@ -27,7 +29,12 @@ const event_command = new SlashCommandBuilder()
     .addSubcommand(subcommand =>
         subcommand
             .setName('create')
-            .setDescription('Create a new Vanguard Corpse event'))
+            .setDescription('Create a new Vanguard Corpse event')
+            .addStringOption(option =>
+                option
+                    .setName('password')
+                    .setDescription('Confirmation password')
+                    .setRequired(true)))
     .addSubcommand(subcommand =>
         subcommand
             .setName('signup')
@@ -43,10 +50,58 @@ const event_command = new SlashCommandBuilder()
     .addSubcommand(subcommand =>
         subcommand
             .setName('end')
-            .setDescription('End the current Vanguard Corpse event'));
+            .setDescription('End the current Vanguard Corpse event')
+            .addStringOption(option =>
+                option
+                    .setName('password')
+                    .setDescription('Confirmation password')
+                    .setRequired(true)));
 
 const ensure_moderator_permissions = interaction => {
     return interaction.memberPermissions?.has(PermissionFlagsBits.ModerateMembers);
+};
+
+const build_event_confirmation_buttons = customId => {
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(customId)
+                .setLabel('Confirm')
+                .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+                .setCustomId(`${customId}_cancel`)
+                .setLabel('Cancel')
+                .setStyle(ButtonStyle.Secondary)
+        ),
+    ];
+};
+
+const build_event_confirm_custom_id = (action, discordUserId, eventId = 'none') => {
+    return `${EVENT_BUTTON_PREFIX}${action}:${discordUserId}:${eventId}`;
+};
+
+const parse_event_confirm_custom_id = customId => {
+    if (!customId.startsWith(EVENT_BUTTON_PREFIX)) {
+        return null;
+    }
+
+    const payload = customId.slice(EVENT_BUTTON_PREFIX.length);
+    const [action, discordUserId, eventIdWithSuffix] = payload.split(':');
+    if (!action || !discordUserId || !eventIdWithSuffix) {
+        return null;
+    }
+
+    const eventId = eventIdWithSuffix.replace(/_cancel$/, '');
+    return {
+        action,
+        discordUserId,
+        eventId: eventId === 'none' ? null : Number(eventId),
+        cancelled: customId.endsWith('_cancel'),
+    };
+};
+
+const has_valid_event_password = interaction => {
+    return interaction.options.getString('password') === EVENT_CONFIRM_PASSWORD;
 };
 
 const create_concurrency_limiter = limit => {
@@ -208,6 +263,16 @@ const has_active_snapshot_run = async (db, eventId) => {
         [eventId, ACTIVE_RUN_STATUSES]
     );
     return rows.length > 0;
+};
+
+const list_active_snapshot_runs = async (db, eventId) => {
+    const [rows] = await db.query(
+        `SELECT * FROM event_snapshot_runs
+         WHERE event_id = ? AND status IN (?)
+         ORDER BY started_at ASC, id ASC`,
+        [eventId, ACTIVE_RUN_STATUSES]
+    );
+    return rows;
 };
 
 const update_event_status = async (db, eventId, fields) => {
@@ -521,6 +586,43 @@ const get_snapshot_run_counts = async (db, snapshotRunId) => {
         [snapshotRunId]
     );
     return rows[0];
+};
+
+const cancel_active_snapshot_runs_for_event = async (connection, eventId, completedAt) => {
+    const activeRuns = await list_active_snapshot_runs(connection, eventId);
+    const cancellableRuns = activeRuns.filter(run => run.snapshot_type !== 'FINAL');
+
+    for (const snapshotRun of cancellableRuns) {
+        await connection.query(
+            `UPDATE event_snapshot_tasks
+             SET status = 'FAILED',
+                 completed_at = ?,
+                 last_attempt_at = ?,
+                 claim_token = NULL,
+                 failure_code = ?,
+                 failure_message = ?
+             WHERE snapshot_run_id = ? AND status IN (?, ?)`,
+            [
+                completedAt,
+                completedAt,
+                'EVENT_END_CANCELLED',
+                'Snapshot run cancelled because the event was ended.',
+                snapshotRun.id,
+                'PENDING',
+                'PROCESSING',
+            ]
+        );
+
+        const counts = await get_snapshot_run_counts(connection, snapshotRun.id);
+        await update_snapshot_run_progress(connection, snapshotRun.id, {
+            status: 'COMPLETED',
+            nextBatchAt: completedAt,
+            completedAt,
+            succeededCount: Number(counts.succeeded_count || 0),
+            failedCount: Number(counts.failed_count || 0),
+            lastError: 'Cancelled by event end.',
+        });
+    }
 };
 
 const update_snapshot_run_progress = async (db, snapshotRunId, payload) => {
@@ -964,6 +1066,65 @@ const create_current_event = async db => {
     return { ok: true, event: eventRecord };
 };
 
+const handle_event_confirmation_button = async (interaction, db, client) => {
+    const parsed = parse_event_confirm_custom_id(interaction.customId);
+    if (!parsed) {
+        return false;
+    }
+
+    if (interaction.user.id !== parsed.discordUserId) {
+        await interaction.reply({ content: 'Only the moderator who requested this action can confirm it.', ephemeral: true });
+        return true;
+    }
+
+    if (parsed.cancelled) {
+        await interaction.update({ content: 'Event action cancelled.', components: [] });
+        return true;
+    }
+
+    if (parsed.action === 'create') {
+        const result = await create_current_event(db);
+        if (!result.ok) {
+            await interaction.update({ content: result.message, components: [] });
+            return true;
+        }
+
+        await send_log_message(client, `Vanguard event created by <@${interaction.user.id}>. event=${result.event.id}`);
+        await interaction.update({
+            content: `Vanguard event created.\nEvent: \`${result.event.name}\`\nStatus: \`${result.event.status}\``,
+            components: [],
+        });
+        return true;
+    }
+
+    if (parsed.action === 'end') {
+        const activeEvent = await get_active_event(db);
+        if (!activeEvent || activeEvent.id !== parsed.eventId) {
+            await interaction.update({
+                content: 'The active event changed before confirmation. Re-run `/event end` if you still want to end the current event.',
+                components: [],
+            });
+            return true;
+        }
+
+        const result = await end_current_event(db);
+        if (!result.ok) {
+            await interaction.update({ content: result.message, components: [] });
+            return true;
+        }
+
+        await send_log_message(client, `Vanguard event ending initiated by <@${interaction.user.id}>. event=${result.event.id} participants=${result.participantCount} run=${result.snapshotRun.id}`);
+        await interaction.update({
+            content: `Vanguard event end sequence started.\nParticipants: \`${result.participantCount}\`\nFINAL snapshot run: \`${result.snapshotRun.id}\`\nThe event will be marked ended after the final snapshot completes.`,
+            components: [],
+        });
+        return true;
+    }
+
+    await interaction.reply({ content: 'Unknown event confirmation action.', ephemeral: true });
+    return true;
+};
+
 const start_current_event = async db => {
     return run_in_transaction(db, async connection => {
         const eventRecord = await get_active_event_for_update(connection);
@@ -1003,11 +1164,8 @@ const end_current_event = async db => {
             return { ok: false, message: 'There is no Vanguard event currently running.' };
         }
 
-        if (await has_active_snapshot_run(connection, eventRecord.id)) {
-            return { ok: false, message: 'An event snapshot run is already active. Wait for it to finish before ending the event.' };
-        }
-
         const endingStartedAt = Date.now();
+        await cancel_active_snapshot_runs_for_event(connection, eventRecord.id, endingStartedAt);
         const { run, participantCount } = await create_snapshot_run_with_tasks_in_connection(connection, {
             eventId: eventRecord.id,
             snapshotType: 'FINAL',
@@ -1078,14 +1236,17 @@ const event_interaction = async (interaction, db, client) => {
 
     if (subcommand === 'create') {
         await interaction.deferReply({ ephemeral: true });
-        const result = await create_current_event(db);
-        if (!result.ok) {
-            await interaction.editReply(result.message);
+        if (!has_valid_event_password(interaction)) {
+            await interaction.editReply('Incorrect password.');
             return;
         }
 
-        await send_log_message(client, `Vanguard event created by <@${interaction.user.id}>. event=${result.event.id}`);
-        await interaction.editReply(`Vanguard event created.\nEvent: \`${result.event.name}\`\nStatus: \`${result.event.status}\``);
+        await interaction.editReply({
+            content: 'Confirm creating a new Vanguard event.',
+            components: build_event_confirmation_buttons(
+                build_event_confirm_custom_id('create', interaction.user.id)
+            ),
+        });
         return;
     }
 
@@ -1104,14 +1265,23 @@ const event_interaction = async (interaction, db, client) => {
 
     if (subcommand === 'end') {
         await interaction.deferReply({ ephemeral: true });
-        const result = await end_current_event(db);
-        if (!result.ok) {
-            await interaction.editReply(result.message);
+        if (!has_valid_event_password(interaction)) {
+            await interaction.editReply('Incorrect password.');
             return;
         }
 
-        await send_log_message(client, `Vanguard event ending initiated by <@${interaction.user.id}>. event=${result.event.id} participants=${result.participantCount} run=${result.snapshotRun.id}`);
-        await interaction.editReply(`Vanguard event end sequence started.\nParticipants: \`${result.participantCount}\`\nFINAL snapshot run: \`${result.snapshotRun.id}\`\nThe event will be marked ended after the final snapshot completes.`);
+        const activeEvent = await get_active_event(db);
+        if (!activeEvent || activeEvent.status !== 'RUNNING') {
+            await interaction.editReply('There is no Vanguard event currently running.');
+            return;
+        }
+
+        await interaction.editReply({
+            content: `Confirm ending Vanguard event \`${activeEvent.name}\` (\`${activeEvent.id}\`).`,
+            components: build_event_confirmation_buttons(
+                build_event_confirm_custom_id('end', interaction.user.id, activeEvent.id)
+            ),
+        });
     }
 };
 
@@ -1135,6 +1305,7 @@ const create_event_processor_runner = processor => {
 module.exports = {
     event_command,
     event_interaction,
+    handle_event_confirmation_button,
     tick_event_snapshot_processor,
     EVENT_SNAPSHOT_TICK_MS,
     EVENT_HYPIXEL_MAX_ATTEMPTS,
