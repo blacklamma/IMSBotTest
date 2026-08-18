@@ -78,6 +78,18 @@ const IMA_gm_ign = 'sarln';
 const hall_of_shame_channel = '867647682255781949';
 const hall_of_shame_reactions = ['<:GoodHoS:954028056882839582>', '<:BadHoS:954028075664937021>'];
 
+const HYPIXEL_REQUEST_TIMEOUT_MS = 15000;
+
+const EVENT_DEFAULT_NAME = 'Vanguard Corpse Event';
+const EVENT_SNAPSHOT_BATCH_SIZE = 50;
+const EVENT_SNAPSHOT_BATCH_DELAY_MS = 5 * 60 * 1000;
+const EVENT_SNAPSHOT_TICK_MS = 60 * 1000;
+const EVENT_SNAPSHOT_CLAIM_TIMEOUT_MS = 15 * 60 * 1000;
+const EVENT_HOURLY_SNAPSHOT_INTERVAL_MS = 60 * 60 * 1000;
+const EVENT_HYPIXEL_MAX_ATTEMPTS = 3;
+const EVENT_SIGNUP_HYPIXEL_CONCURRENCY = 5;
+const EVENT_LEADERBOARD_PAGE_SIZE = 20;
+
 module.exports = { 
     embedColor, 
     guild_id,
@@ -140,5 +152,15 @@ module.exports = {
     IMC_gm_ign,
     IMA_gm_ign,
     hall_of_shame_channel,
-    hall_of_shame_reactions
+    hall_of_shame_reactions,
+    HYPIXEL_REQUEST_TIMEOUT_MS,
+    EVENT_DEFAULT_NAME,
+    EVENT_SNAPSHOT_BATCH_SIZE,
+    EVENT_SNAPSHOT_BATCH_DELAY_MS,
+    EVENT_SNAPSHOT_TICK_MS,
+    EVENT_SNAPSHOT_CLAIM_TIMEOUT_MS,
+    EVENT_HOURLY_SNAPSHOT_INTERVAL_MS,
+    EVENT_HYPIXEL_MAX_ATTEMPTS,
+    EVENT_SIGNUP_HYPIXEL_CONCURRENCY,
+    EVENT_LEADERBOARD_PAGE_SIZE
 }

@@ -36,6 +36,7 @@ const { autosync_roles_all_guilds } = require('./src/bot/commands/autosync_roles
 const { fetch_guild_data, rank_guild_command, rank_guild_interaction } = require('./src/bot/commands/rank_guild');
 const { refresh_current_snapshot_command, refresh_current_snapshot_interaction, sync_all_guilds } = require('./src/bot/commands/refresh_current_snapshot');
 const { check_garden_command, check_garden_interaction } = require('./src/bot/commands/check_garden');
+const { event_command, event_interaction, handle_event_confirmation_button, handle_event_leaderboard_button, tick_event_snapshot_processor, EVENT_SNAPSHOT_TICK_MS } = require('./src/bot/commands/event');
 const { track_user_command, track_user_interaction, process_active_tracking_sessions, stop_all_tracking } = require('./src/bot/commands/track_user');
 const PIN_THREAD_PARENT_IDS = [qna_channel];
 // Create a new client instance
@@ -54,15 +55,24 @@ const shouldAutoPinThread = thread => {
 };
 
 const THREAD_PIN_MESSAGE = 'Pinned for mobile users: tap to jump to the top of this thread.';
+let event_processor_running = false;
 
-const sendLogMessage = async (client, content) => {
+const { send_log_message } = require('./src/bot/utils/send_log_message');
+
+const run_event_snapshot_processor = async () => {
+    if (event_processor_running) {
+        return false;
+    }
+
+    event_processor_running = true;
     try {
-        const channel = await client.channels.fetch(log_channel);
-        if (channel && channel.isTextBased()) {
-            await channel.send(content);
-        }
+        await tick_event_snapshot_processor(db, client);
+        return true;
     } catch (error) {
-        console.error('Error sending log message:', error);
+        console.error('Event snapshot processor failed:', error);
+        return false;
+    } finally {
+        event_processor_running = false;
     }
 };
 
@@ -95,15 +105,17 @@ client.once('ready', async () => {
             const results = await sync_all_guilds(db, client);
             const logText = 'Auto sync_current_guild_members:\n' + results.join('\n');
             console.log(logText);
-            await sendLogMessage(client, logText);
+            await send_log_message(client, logText);
         } catch (err) {
             console.error('Auto sync_current_guild_members failed:', err);
-            await sendLogMessage(client, 'Auto sync_current_guild_members failed: ' + (err?.message || err));
+            await send_log_message(client, 'Auto sync_current_guild_members failed: ' + (err?.message || err));
         }
     }, 24 * 60 * 60 * 1000); // Sync guild members every day
     setInterval(async () => {
         process_active_tracking_sessions(client, db);
     }, 5 * 60 * 1000); // Check tracking sessions every 5 minutes
+    setInterval(run_event_snapshot_processor, EVENT_SNAPSHOT_TICK_MS);
+    await run_event_snapshot_processor();
     await registerSlashCommands();
 });
 
@@ -127,7 +139,8 @@ async function registerSlashCommands() {
         rank_guild_command,
         check_garden_command,
         track_user_command,
-        refresh_current_snapshot_command
+        refresh_current_snapshot_command,
+        event_command
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -203,11 +216,18 @@ client.on('interactionCreate', async interaction => {
             case 'sync_current_guild_members':
                 await refresh_current_snapshot_interaction(interaction, db, client);
                 break;
+            case 'event':
+                await event_interaction(interaction, db, client);
+                break;
         }
     } 
     else if (interaction.isButton()) {
         if (interaction.customId.startsWith('apply_')) {
             await handle_guild_selection(interaction, db, client);
+        } else if (interaction.customId.startsWith('event_confirm_')) {
+            await handle_event_confirmation_button(interaction, db, client);
+        } else if (interaction.customId.startsWith('event_leaderboard_')) {
+            await handle_event_leaderboard_button(interaction, db);
         } else {
             switch (interaction.customId) {
                 case 'guild_accept':
@@ -324,3 +344,5 @@ client.login(process.env.DISCORD_TOKEN).catch(error => {
     console.error('Error logging in to Discord:', error);
     botStatus.isRunning = false; // Set bot status to not running if login fails
 });
+
+
