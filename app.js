@@ -115,7 +115,6 @@ client.once('ready', async () => {
         process_active_tracking_sessions(client, db);
     }, 5 * 60 * 1000); // Check tracking sessions every 5 minutes
     setInterval(run_event_snapshot_processor, EVENT_SNAPSHOT_TICK_MS);
-    await run_event_snapshot_processor();
     await registerSlashCommands();
 });
 

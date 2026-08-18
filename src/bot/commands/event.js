@@ -12,6 +12,7 @@ const {
     EVENT_SNAPSHOT_TICK_MS,
     EVENT_SNAPSHOT_CLAIM_TIMEOUT_MS,
     EVENT_HOURLY_SNAPSHOT_INTERVAL_MS,
+    EVENT_HOURLY_SNAPSHOT_OFFSET_MS,
     EVENT_HYPIXEL_MAX_ATTEMPTS,
     EVENT_SIGNUP_HYPIXEL_CONCURRENCY,
     EVENT_LEADERBOARD_PAGE_SIZE,
@@ -660,14 +661,28 @@ const get_latest_snapshot_run_by_type = async (db, eventId, snapshotType) => {
     return rows[0] || null;
 };
 
+const get_latest_hourly_snapshot_boundary = now => {
+    return (
+        Math.floor((now - EVENT_HOURLY_SNAPSHOT_OFFSET_MS) / EVENT_HOURLY_SNAPSHOT_INTERVAL_MS) *
+        EVENT_HOURLY_SNAPSHOT_INTERVAL_MS
+    ) + EVENT_HOURLY_SNAPSHOT_OFFSET_MS;
+};
+
 const should_create_hourly_snapshot = (eventRecord, latestHourlyRun, now) => {
     if (!eventRecord || eventRecord.status !== 'RUNNING' || !eventRecord.started_at) {
         return false;
     }
-    if (!latestHourlyRun) {
-        return now - eventRecord.started_at >= EVENT_HOURLY_SNAPSHOT_INTERVAL_MS;
+
+    const latestBoundary = get_latest_hourly_snapshot_boundary(now);
+    if (now < latestBoundary || latestBoundary < eventRecord.started_at) {
+        return false;
     }
-    return now - latestHourlyRun.started_at >= EVENT_HOURLY_SNAPSHOT_INTERVAL_MS;
+
+    if (!latestHourlyRun) {
+        return true;
+    }
+
+    return latestHourlyRun.started_at < latestBoundary;
 };
 
 const build_snapshot_retry_delay = retryDetails => {
