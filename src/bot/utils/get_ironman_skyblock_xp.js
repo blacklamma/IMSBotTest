@@ -216,6 +216,29 @@ const extract_vanguard_count_from_member = memberData => {
     return memberData?.glacite_player_data?.corpses_looted?.vanguard ?? 0;
 };
 
+const extract_event_counts_from_member = memberData => {
+    const corpses = memberData?.glacite_player_data?.corpses_looted ?? {};
+    const mining = memberData?.mining_core ?? {};
+    const counter = value => {
+        if (value === undefined || value === null) return 0;
+        if (!Number.isSafeInteger(value) || value < 0) {
+            throw new Error('Invalid event counter in SkyBlock profile.');
+        }
+        return value;
+    };
+    return {
+        count: counter(corpses.vanguard),
+        lapisCorpseCount: counter(corpses.lapis),
+        tungstenCorpseCount: counter(corpses.tungsten),
+        umberCorpseCount: counter(corpses.umber),
+        glacitePowderAvailable: counter(mining.powder_glacite),
+        glacitePowderSpent: counter(mining.powder_spent_glacite),
+        overallCorpseCount: counter(Object.values(corpses).reduce((sum, value) => sum + counter(value), 0)),
+        // Include spent powder so purchases and Heart of the Mountain resets do not change the score.
+        glacitePowder: counter(counter(mining.powder_glacite) + counter(mining.powder_spent_glacite)),
+    };
+};
+
 const is_retryable_hypixel_failure = failureCode => {
     return [
         'HYPIXEL_RATE_LIMITED',
@@ -226,7 +249,7 @@ const is_retryable_hypixel_failure = failureCode => {
     ].includes(failureCode);
 };
 
-const get_vanguard_corpse_count = async (uuid, options = {}) => {
+const get_event_counts = async (uuid, options = {}) => {
     const normalizedUuid = normalize_uuid(uuid);
     const profileResponse = await fetch_skyblock_profiles(normalizedUuid, process.env.HYPIXEL_API_KEY, options);
 
@@ -262,10 +285,16 @@ const get_vanguard_corpse_count = async (uuid, options = {}) => {
         };
     }
 
+    let counts;
+    try {
+        counts = extract_event_counts_from_member(memberData);
+    } catch (error) {
+        return { ok: false, failureCode: 'INVALID_EVENT_COUNTER', message: error.message, retryable: false };
+    }
     return {
         ok: true,
         minecraftUuid: normalizedUuid,
-        count: extract_vanguard_count_from_member(memberData),
+        ...counts,
         capturedAt: Date.now(),
         profileId: selectedProfileResult.profile.profile_id,
         profileName: selectedProfileResult.profile.cute_name || selectedProfileResult.profile.profile_id,
@@ -303,7 +332,9 @@ module.exports = {
     select_vanguard_ironman_profile,
     select_preferred_skyblock_profile,
     extract_vanguard_count_from_member,
-    get_vanguard_corpse_count,
+    get_vanguard_corpse_count: get_event_counts,
+    get_event_counts,
+    extract_event_counts_from_member,
     is_retryable_hypixel_failure,
     get_ironman_skyblock_xp,
 };
