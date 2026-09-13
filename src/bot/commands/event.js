@@ -2,7 +2,7 @@
 require('dotenv').config();
 const { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, PermissionFlagsBits, SlashCommandBuilder } = require('discord.js');
 const { create_embed } = require('./rank_guild');
-const { get_vanguard_corpse_count } = require('../utils/get_ironman_skyblock_xp');
+const { get_event_counts } = require('../utils/get_ironman_skyblock_xp');
 const { send_log_message } = require('../utils/send_log_message');
 
 const {
@@ -306,14 +306,28 @@ const create_event_participant = async (db, participant) => {
             minecraft_uuid,
             minecraft_username,
             signup_corpse_count,
+            signup_overall_corpse_count,
+            signup_glacite_powder,
+            signup_lapis_corpse_count,
+            signup_tungsten_corpse_count,
+            signup_umber_corpse_count,
+            signup_glacite_powder_available,
+            signup_glacite_powder_spent,
             signup_at
-        ) VALUES (?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
             participant.eventId,
             participant.discordUserId,
             participant.minecraftUuid,
             participant.minecraftUsername,
             participant.signupCorpseCount,
+            participant.signupOverallCorpseCount ?? null,
+            participant.signupGlacitePowder ?? null,
+            participant.signupLapisCorpseCount ?? null,
+            participant.signupTungstenCorpseCount ?? null,
+            participant.signupUmberCorpseCount ?? null,
+            participant.signupGlacitePowderAvailable ?? null,
+            participant.signupGlacitePowderSpent ?? null,
             participant.signupAt,
         ]
     );
@@ -421,10 +435,17 @@ const create_snapshot_run_with_tasks = async (db, options) => {
 const insert_event_snapshot = async (db, payload) => {
     await db.query(
         `INSERT INTO event_snapshots (
-            snapshot_run_id, event_id, participant_id, snapshot_type, corpse_count, captured_at, is_final_snapshot
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            snapshot_run_id, event_id, participant_id, snapshot_type, corpse_count, overall_corpse_count, glacite_powder, lapis_corpse_count, tungsten_corpse_count, umber_corpse_count, glacite_powder_available, glacite_powder_spent, captured_at, is_final_snapshot
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
             corpse_count = VALUES(corpse_count),
+            overall_corpse_count = VALUES(overall_corpse_count),
+            glacite_powder = VALUES(glacite_powder),
+            lapis_corpse_count = VALUES(lapis_corpse_count),
+            tungsten_corpse_count = VALUES(tungsten_corpse_count),
+            umber_corpse_count = VALUES(umber_corpse_count),
+            glacite_powder_available = VALUES(glacite_powder_available),
+            glacite_powder_spent = VALUES(glacite_powder_spent),
             captured_at = VALUES(captured_at),
             is_final_snapshot = VALUES(is_final_snapshot)`,
         [
@@ -433,6 +454,13 @@ const insert_event_snapshot = async (db, payload) => {
             payload.participantId,
             payload.snapshotType,
             payload.corpseCount,
+            payload.overallCorpseCount ?? null,
+            payload.glacitePowder ?? null,
+            payload.lapisCorpseCount ?? null,
+            payload.tungstenCorpseCount ?? null,
+            payload.umberCorpseCount ?? null,
+            payload.glacitePowderAvailable ?? null,
+            payload.glacitePowderSpent ?? null,
             payload.capturedAt,
             payload.snapshotType === 'FINAL' ? 1 : 0,
         ]
@@ -474,6 +502,13 @@ const create_initial_signup_snapshot = async (connection, payload) => {
         participantId: payload.participantId,
         snapshotType: 'INITIAL',
         corpseCount: payload.corpseCount,
+        overallCorpseCount: payload.overallCorpseCount,
+        glacitePowder: payload.glacitePowder,
+        lapisCorpseCount: payload.lapisCorpseCount,
+        tungstenCorpseCount: payload.tungstenCorpseCount,
+        umberCorpseCount: payload.umberCorpseCount,
+        glacitePowderAvailable: payload.glacitePowderAvailable,
+        glacitePowderSpent: payload.glacitePowderSpent,
         capturedAt: baselineAt,
     });
 
@@ -757,7 +792,7 @@ const finalize_snapshot_run_if_finished = async (db, client, snapshotRun) => {
     return false;
 };
 
-const process_snapshot_run_batch = async (db, client, snapshotRun, fetchCorpseCount = get_vanguard_corpse_count) => {
+const process_snapshot_run_batch = async (db, client, snapshotRun, fetchCorpseCount = get_event_counts) => {
     const claimToken = `${snapshotRun.id}_${Date.now()}`;
     const claimedTasks = await claim_snapshot_tasks(
         db,
@@ -784,6 +819,13 @@ const process_snapshot_run_batch = async (db, client, snapshotRun, fetchCorpseCo
                 participantId: task.participant_id,
                 snapshotType: snapshotRun.snapshot_type,
                 corpseCount: lookupResult.count,
+                overallCorpseCount: lookupResult.overallCorpseCount,
+                glacitePowder: lookupResult.glacitePowder,
+                lapisCorpseCount: lookupResult.lapisCorpseCount,
+                tungstenCorpseCount: lookupResult.tungstenCorpseCount,
+                umberCorpseCount: lookupResult.umberCorpseCount,
+                glacitePowderAvailable: lookupResult.glacitePowderAvailable,
+                glacitePowderSpent: lookupResult.glacitePowderSpent,
                 capturedAt: lookupResult.capturedAt,
             });
             continue;
@@ -866,7 +908,7 @@ const create_hourly_snapshots_if_needed = async (db, client) => {
 };
 
 const tick_event_snapshot_processor = async (db, client, options = {}) => {
-    const fetchCorpseCount = options.fetchCorpseCount || get_vanguard_corpse_count;
+    const fetchCorpseCount = options.fetchCorpseCount || get_event_counts;
     const now = Date.now();
     await release_stale_processing_tasks(db, now - EVENT_SNAPSHOT_CLAIM_TIMEOUT_MS, now);
     await create_hourly_snapshots_if_needed(db, client);
@@ -880,7 +922,7 @@ const tick_event_snapshot_processor = async (db, client, options = {}) => {
 const get_event_leaderboard_rows = async (db, eventId) => {
     const participants = await list_event_participants(db, eventId);
     const [snapshotRows] = await db.query(
-        `SELECT participant_id, snapshot_type, corpse_count, captured_at
+        `SELECT participant_id, snapshot_type, corpse_count, overall_corpse_count, glacite_powder, captured_at
          FROM event_snapshots
          WHERE event_id = ?
          ORDER BY participant_id ASC, captured_at ASC, id ASC`,
@@ -908,6 +950,11 @@ const get_event_leaderboard_rows = async (db, eventId) => {
             minecraft_username: participant.minecraft_username,
             baseline_corpse_count: baselineSnapshot?.corpse_count ?? null,
             baseline_snapshot_type: baselineSnapshot?.snapshot_type ?? null,
+            ...Object.fromEntries(['overall_corpse_count', 'glacite_powder'].flatMap(metric => [
+                [`baseline_${metric}`, baselineSnapshot?.[metric] ?? null],
+                [`latest_${metric}`, latestSnapshot?.[metric] ?? null],
+                [`final_${metric}`, finalSnapshot?.[metric] ?? null],
+            ])),
             final_corpse_count: finalSnapshot?.corpse_count ?? null,
             latest_corpse_count: latestSnapshot?.corpse_count ?? null,
             latest_captured_at: latestSnapshot?.captured_at ?? null,
@@ -915,19 +962,19 @@ const get_event_leaderboard_rows = async (db, eventId) => {
     });
 };
 
-const build_leaderboard_entries = (eventRecord, participantRows) => {
+const build_leaderboard_entries = (eventRecord, participantRows, metric = 'corpse_count') => {
     const entries = participantRows.map(row => {
         const displayName = row.minecraft_username || row.minecraft_uuid;
-        const hasBaselineSnapshot = row.baseline_corpse_count !== null && row.baseline_corpse_count !== undefined;
+        const hasBaselineSnapshot = row[`baseline_${metric}`] !== null && row[`baseline_${metric}`] !== undefined;
 
         if (!hasBaselineSnapshot) {
-            return { displayName, score: null, state: 'PENDING', note: null };
+            return { displayName, score: null, state: row.baseline_snapshot_type ? 'UNAVAILABLE' : 'PENDING', note: null };
         }
 
-        const finalValueExists = row.final_corpse_count !== null && row.final_corpse_count !== undefined;
+        const finalValueExists = row[`final_${metric}`] !== null && row[`final_${metric}`] !== undefined;
         const currentValue = eventRecord.status === 'ENDED' && finalValueExists
-            ? row.final_corpse_count
-            : row.latest_corpse_count;
+            ? row[`final_${metric}`]
+            : row[`latest_${metric}`];
 
         if (currentValue === null || currentValue === undefined) {
             return { displayName, score: null, state: 'UNAVAILABLE', note: null };
@@ -936,7 +983,7 @@ const build_leaderboard_entries = (eventRecord, participantRows) => {
         const finalFailed = eventRecord.status === 'ENDED' && !finalValueExists && row.latest_captured_at !== null;
         return {
             displayName,
-            score: currentValue - row.baseline_corpse_count,
+            score: currentValue - row[`baseline_${metric}`],
             state: 'OK',
             note: finalFailed ? 'latest snapshot used; final failed' : null,
         };
@@ -962,7 +1009,7 @@ const build_leaderboard_entries = (eventRecord, participantRows) => {
 };
 const format_signed_gain = value => {
     const sign = value >= 0 ? '+' : '';
-    return `${sign}${value.toLocaleString()} Vanguard Corpses`;
+    return `${sign}${value.toLocaleString()}`;
 };
 
 const build_leaderboard_rows = entries => {
@@ -989,12 +1036,21 @@ const get_leaderboard_payload_for_event = async (db, eventRecord) => {
     }
 
     const rows = await get_event_leaderboard_rows(db, eventRecord.id);
-    const entries = build_leaderboard_entries(eventRecord, rows);
+    const leaderboards = [
+        ['corpse_count', 'Vanguard Corpses'],
+        ['overall_corpse_count', 'Overall Corpses'],
+        ['glacite_powder', 'Glacite Powder'],
+    ].map(([metric, label]) => {
+        const entries = build_leaderboard_entries(eventRecord, rows, metric);
+        return { metric, label, entries, rows: build_leaderboard_rows(entries) };
+    });
+    const entries = leaderboards[0].entries;
     return {
         ok: true,
         event: eventRecord,
         entries,
-        rows: build_leaderboard_rows(entries),
+        leaderboards,
+        rows: leaderboards[0].rows,
     };
 };
 
@@ -1028,16 +1084,17 @@ const parse_event_leaderboard_button_custom_id = customId => {
     return { direction, eventId, page };
 };
 
+const leaderboard_page_size = Math.min(EVENT_LEADERBOARD_PAGE_SIZE, 10);
 const get_event_leaderboard_page_count = rows => {
-    return Math.max(1, Math.ceil(rows.length / EVENT_LEADERBOARD_PAGE_SIZE));
+    return Math.max(1, Math.ceil(rows.length / leaderboard_page_size));
 };
 
 const build_event_leaderboard_embed = payload => {
     const pageCount = get_event_leaderboard_page_count(payload.rows);
     const currentPage = Math.min(Math.max(payload.page || 0, 0), pageCount - 1);
     const pageRows = payload.rows.slice(
-        currentPage * EVENT_LEADERBOARD_PAGE_SIZE,
-        (currentPage + 1) * EVENT_LEADERBOARD_PAGE_SIZE
+        currentPage * leaderboard_page_size,
+        (currentPage + 1) * leaderboard_page_size
     );
 
     const embed = new EmbedBuilder()
@@ -1045,10 +1102,15 @@ const build_event_leaderboard_embed = payload => {
         .setColor('#FFC3FF')
         .setFooter({ text: `Page ${currentPage + 1}/${pageCount}` })
         .setDescription(
-            `${payload.event.status === 'ENDED' ? 'Final Vanguard leaderboard\n' : 'Current Vanguard leaderboard\n'}${pageRows.join('')}`
+            `${payload.event.status === 'ENDED' ? 'Final' : 'Current'} ${payload.label} leaderboard (gained)\n${pageRows.join('')}`
         );
 
     return { embed, currentPage, pageCount };
+};
+
+const build_event_leaderboard_embeds = payload => {
+    const boards = payload.leaderboards.map(board => build_event_leaderboard_embed({ ...payload, ...board }));
+    return { embeds: boards.map(board => board.embed), currentPage: boards[0].currentPage, pageCount: boards[0].pageCount };
 };
 
 const build_event_leaderboard_components = (eventId, currentPage, pageCount) => {
@@ -1090,13 +1152,13 @@ const handle_event_leaderboard_button = async (interaction, db) => {
         nextPage = parsed.page + 1 < pageCount ? parsed.page + 1 : 0;
     }
 
-    const { embed, currentPage } = build_event_leaderboard_embed({ ...payload, page: nextPage });
+    const { embeds, currentPage } = build_event_leaderboard_embeds({ ...payload, page: nextPage });
     const components = build_event_leaderboard_components(payload.event.id, currentPage, pageCount);
-    await interaction.update({ embeds: [embed], components });
+    await interaction.update({ embeds, components });
     return true;
 };
 
-const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = get_vanguard_corpse_count, options = {}) => {
+const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = get_event_counts, options = {}) => {
     const signupFetchLimiter = options.signupFetchLimiter || signup_hypixel_lookup_limiter;
     const now = Date.now();
     const eventRecord = await get_signup_event(db);
@@ -1157,6 +1219,13 @@ const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = ge
             minecraftUuid: linkedAccount.uuid,
             minecraftUsername: linkedAccount.ign,
             signupCorpseCount: vanguardResult.count,
+            signupOverallCorpseCount: vanguardResult.overallCorpseCount,
+            signupGlacitePowder: vanguardResult.glacitePowder,
+            signupLapisCorpseCount: vanguardResult.lapisCorpseCount,
+            signupTungstenCorpseCount: vanguardResult.tungstenCorpseCount,
+            signupUmberCorpseCount: vanguardResult.umberCorpseCount,
+            signupGlacitePowderAvailable: vanguardResult.glacitePowderAvailable,
+            signupGlacitePowderSpent: vanguardResult.glacitePowderSpent,
             signupAt: now,
         });
 
@@ -1165,6 +1234,13 @@ const signup_for_current_event = async (db, discordUserId, fetchCorpseCount = ge
                 eventId: lockedEvent.id,
                 participantId: participant.id,
                 corpseCount: vanguardResult.count,
+                overallCorpseCount: vanguardResult.overallCorpseCount,
+                glacitePowder: vanguardResult.glacitePowder,
+                lapisCorpseCount: vanguardResult.lapisCorpseCount,
+                tungstenCorpseCount: vanguardResult.tungstenCorpseCount,
+                umberCorpseCount: vanguardResult.umberCorpseCount,
+                glacitePowderAvailable: vanguardResult.glacitePowderAvailable,
+                glacitePowderSpent: vanguardResult.glacitePowderSpent,
                 capturedAt: vanguardResult.capturedAt,
                 startedAt: now,
             });
@@ -1326,6 +1402,8 @@ const event_interaction = async (interaction, db, client) => {
             `Signed up for **${result.event.name}**.\n` +
             `Linked account: \`${result.participant.minecraft_username}\`\n` +
             `Current Vanguard Corpses: \`${result.vanguard.count}\`\n` +
+            `Current Overall Corpses: \`${result.vanguard.overallCorpseCount}\`\n` +
+            `Total Glacite Powder: \`${result.vanguard.glacitePowder}\`\n` +
             `Profile used: \`${result.vanguard.profileName}\` (${result.vanguard.selectionReason})`
         );
         return;
@@ -1339,9 +1417,9 @@ const event_interaction = async (interaction, db, client) => {
             return;
         }
 
-        const { embed, currentPage, pageCount } = build_event_leaderboard_embed({ ...payload, page: 0 });
+        const { embeds, currentPage, pageCount } = build_event_leaderboard_embeds({ ...payload, page: 0 });
         await interaction.editReply({
-            embeds: [embed],
+            embeds,
             components: build_event_leaderboard_components(payload.event.id, currentPage, pageCount),
         });
         return;
@@ -1431,6 +1509,8 @@ module.exports = {
     should_create_hourly_snapshot,
     build_snapshot_retry_delay,
     build_leaderboard_entries,
+    build_event_leaderboard_embeds,
+    insert_event_snapshot,
     signup_for_current_event,
     create_hourly_snapshots_if_needed,
     process_snapshot_run_batch,
