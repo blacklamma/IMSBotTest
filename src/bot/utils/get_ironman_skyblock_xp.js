@@ -234,7 +234,7 @@ const extract_event_counts_from_member = memberData => {
         glacitePowderAvailable: counter(mining.powder_glacite),
         glacitePowderSpent: counter(mining.powder_spent_glacite),
         overallCorpseCount: counter(Object.values(corpses).reduce((sum, value) => sum + counter(value), 0)),
-        glacitePowder: counter(mining.powder_spent_glacite),
+        glacitePowder: counter(mining.powder_glacite),
     };
 };
 
