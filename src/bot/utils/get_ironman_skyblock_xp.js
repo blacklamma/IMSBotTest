@@ -234,8 +234,7 @@ const extract_event_counts_from_member = memberData => {
         glacitePowderAvailable: counter(mining.powder_glacite),
         glacitePowderSpent: counter(mining.powder_spent_glacite),
         overallCorpseCount: counter(Object.values(corpses).reduce((sum, value) => sum + counter(value), 0)),
-        // Include spent powder so purchases and Heart of the Mountain resets do not change the score.
-        glacitePowder: counter(counter(mining.powder_glacite) + counter(mining.powder_spent_glacite)),
+        glacitePowder: counter(mining.powder_spent_glacite),
     };
 };
 
